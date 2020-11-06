@@ -1,40 +1,24 @@
 /*
  *
- * Copyright 2015, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
 // Test description at doc/connection-backoff-interop-test-description.md
 
 #include <signal.h>
-#include <unistd.h>
 
 #include <condition_variable>
 #include <memory>
@@ -42,14 +26,14 @@
 #include <sstream>
 
 #include <gflags/gflags.h>
-#include <grpc++/server.h>
-#include <grpc++/server_builder.h>
-#include <grpc++/server_context.h>
 #include <grpc/grpc.h>
 #include <grpc/support/log.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
 
-#include "src/proto/grpc/testing/empty.grpc.pb.h"
-#include "src/proto/grpc/testing/messages.grpc.pb.h"
+#include "src/proto/grpc/testing/empty.pb.h"
+#include "src/proto/grpc/testing/messages.pb.h"
 #include "src/proto/grpc/testing/test.grpc.pb.h"
 #include "test/core/util/reconnect_server.h"
 #include "test/cpp/util/test_config.h"
@@ -62,16 +46,11 @@ DEFINE_int32(retry_port, 0,
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
-using grpc::ServerCredentials;
-using grpc::ServerReader;
-using grpc::ServerReaderWriter;
-using grpc::ServerWriter;
-using grpc::SslServerCredentialsOptions;
 using grpc::Status;
 using grpc::testing::Empty;
-using grpc::testing::ReconnectService;
 using grpc::testing::ReconnectInfo;
 using grpc::testing::ReconnectParams;
+using grpc::testing::ReconnectService;
 
 static bool got_sigint = false;
 
@@ -85,7 +64,7 @@ class ReconnectServiceImpl : public ReconnectService::Service {
     reconnect_server_init(&tcp_server_);
   }
 
-  ~ReconnectServiceImpl() {
+  ~ReconnectServiceImpl() override {
     if (server_started_) {
       reconnect_server_destroy(&tcp_server_);
     }
@@ -93,8 +72,8 @@ class ReconnectServiceImpl : public ReconnectService::Service {
 
   void Poll(int seconds) { reconnect_server_poll(&tcp_server_, seconds); }
 
-  Status Start(ServerContext* context, const ReconnectParams* request,
-               Empty* response) {
+  Status Start(ServerContext* /*context*/, const ReconnectParams* request,
+               Empty* /*response*/) override {
     bool start_server = true;
     std::unique_lock<std::mutex> lock(mu_);
     while (serving_ && !shutdown_) {
@@ -121,8 +100,8 @@ class ReconnectServiceImpl : public ReconnectService::Service {
     return Status::OK;
   }
 
-  Status Stop(ServerContext* context, const Empty* request,
-              ReconnectInfo* response) {
+  Status Stop(ServerContext* /*context*/, const Empty* /*request*/,
+              ReconnectInfo* response) override {
     // extract timestamps and set response
     Verify(response);
     reconnect_server_clear_timestamps(&tcp_server_);
@@ -192,7 +171,7 @@ void RunServer() {
   service.Shutdown();
 }
 
-static void sigint_handler(int x) { got_sigint = true; }
+static void sigint_handler(int /*x*/) { got_sigint = true; }
 
 int main(int argc, char** argv) {
   grpc::testing::InitTest(&argc, &argv, true);

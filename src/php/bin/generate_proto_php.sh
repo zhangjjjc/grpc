@@ -1,40 +1,64 @@
 #!/bin/sh
-# Copyright 2015, Google Inc.
-# All rights reserved.
+# Copyright 2015 gRPC authors.
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     * Redistributions of source code must retain the above copyright
-# notice, this list of conditions and the following disclaimer.
-#     * Redistributions in binary form must reproduce the above
-# copyright notice, this list of conditions and the following disclaimer
-# in the documentation and/or other materials provided with the
-# distribution.
-#     * Neither the name of Google Inc. nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+set -e
+cd $(dirname $0)/../../..
 
-set +e
-cd $(dirname $0)
+# protoc and grpc_*_plugin binaries can be obtained by running
+# $ bazel build @com_google_protobuf//:protoc //src/compiler:all
+PROTOC=bazel-bin/external/com_google_protobuf/protoc
+PLUGIN=protoc-gen-grpc=bazel-bin/src/compiler/grpc_php_plugin
 
-gen_code='../tests/generated_code'
-interop='../tests/interop'
+$PROTOC --proto_path=src/proto/math \
+       --php_out=src/php/tests/generated_code \
+       --grpc_out=src/php/tests/generated_code \
+       --plugin=$PLUGIN \
+       src/proto/math/math.proto
 
-protoc-gen-php -i $gen_code -o $gen_code $gen_code/math.proto
+# replace the Empty message with EmptyMessage
+# because Empty is a PHP reserved word
+output_file=$(mktemp)
+sed 's/message Empty/message EmptyMessage/g' \
+  src/proto/grpc/testing/empty.proto > $output_file
+mv $output_file ./src/proto/grpc/testing/empty.proto
+sed 's/grpc\.testing\.Empty/grpc\.testing\.EmptyMessage/g' \
+  src/proto/grpc/testing/test.proto > $output_file
+mv $output_file ./src/proto/grpc/testing/test.proto
 
-protoc-gen-php -i $interop -o $interop $interop/test.proto
+# interop test protos
+$PROTOC --proto_path=. \
+       --php_out=src/php/tests/interop \
+       --grpc_out=src/php/tests/interop \
+       --plugin=$PLUGIN \
+       src/proto/grpc/testing/messages.proto \
+       src/proto/grpc/testing/empty.proto \
+       src/proto/grpc/testing/test.proto
+
+# change it back
+sed 's/message EmptyMessage/message Empty/g' \
+  src/proto/grpc/testing/empty.proto > $output_file
+mv $output_file ./src/proto/grpc/testing/empty.proto
+sed 's/grpc\.testing\.EmptyMessage/grpc\.testing\.Empty/g' \
+  src/proto/grpc/testing/test.proto > $output_file
+mv $output_file ./src/proto/grpc/testing/test.proto
+
+# Hack for xDS interop: need this to be a separate file in the correct namespace.
+# To be removed when grpc_php_plugin generates service stubs.
+echo '<?php
+// DO NOT EDIT
+namespace Grpc\Testing;
+class LoadBalancerStatsServiceStub {
+}
+' > ./src/php/tests/interop/Grpc/Testing/LoadBalancerStatsServiceStub.php

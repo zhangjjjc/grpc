@@ -1,157 +1,65 @@
 /*
  *
- * Copyright 2015, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
-#include <thread>
+#include <climits>
 
-#include <grpc++/channel.h>
-#include <grpc++/client_context.h>
-#include <grpc++/create_channel.h>
-#include <grpc++/server.h>
-#include <grpc++/server_builder.h>
-#include <grpc++/server_context.h>
 #include <grpc/grpc.h>
-#include <grpc/support/thd.h>
+#include <grpc/support/log.h>
 #include <grpc/support/time.h>
-#include <gtest/gtest.h>
+#include <grpcpp/channel.h>
+#include <grpcpp/client_context.h>
+#include <grpcpp/create_channel.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
+#include <grpcpp/test/default_reactor_test_peer.h>
 
 #include "src/proto/grpc/testing/duplicate/echo_duplicate.grpc.pb.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
+#include "src/proto/grpc/testing/echo_mock.grpc.pb.h"
 #include "test/core/util/port.h"
 #include "test/core/util/test_config.h"
 
+#include <grpcpp/test/mock_stream.h>
+
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include <iostream>
+
+using grpc::testing::DefaultReactorTestPeer;
 using grpc::testing::EchoRequest;
 using grpc::testing::EchoResponse;
 using grpc::testing::EchoTestService;
-using std::chrono::system_clock;
+using grpc::testing::MockClientReaderWriter;
+using std::vector;
+using ::testing::_;
+using ::testing::AtLeast;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SaveArg;
+using ::testing::SetArgPointee;
+using ::testing::WithArg;
 
 namespace grpc {
 namespace testing {
 
 namespace {
-template <class W, class R>
-class MockClientReaderWriter GRPC_FINAL
-    : public ClientReaderWriterInterface<W, R> {
- public:
-  void WaitForInitialMetadata() GRPC_OVERRIDE {}
-  bool Read(R* msg) GRPC_OVERRIDE { return true; }
-  bool Write(const W& msg) GRPC_OVERRIDE { return true; }
-  bool WritesDone() GRPC_OVERRIDE { return true; }
-  Status Finish() GRPC_OVERRIDE { return Status::OK; }
-};
-template <>
-class MockClientReaderWriter<EchoRequest, EchoResponse> GRPC_FINAL
-    : public ClientReaderWriterInterface<EchoRequest, EchoResponse> {
- public:
-  MockClientReaderWriter() : writes_done_(false) {}
-  void WaitForInitialMetadata() GRPC_OVERRIDE {}
-  bool Read(EchoResponse* msg) GRPC_OVERRIDE {
-    if (writes_done_) return false;
-    msg->set_message(last_message_);
-    return true;
-  }
-
-  bool Write(const EchoRequest& msg,
-             const WriteOptions& options) GRPC_OVERRIDE {
-    gpr_log(GPR_INFO, "mock recv msg %s", msg.message().c_str());
-    last_message_ = msg.message();
-    return true;
-  }
-  bool WritesDone() GRPC_OVERRIDE {
-    writes_done_ = true;
-    return true;
-  }
-  Status Finish() GRPC_OVERRIDE { return Status::OK; }
-
- private:
-  bool writes_done_;
-  grpc::string last_message_;
-};
-
-// Mocked stub.
-class MockStub : public EchoTestService::StubInterface {
- public:
-  MockStub() {}
-  ~MockStub() {}
-  Status Echo(ClientContext* context, const EchoRequest& request,
-              EchoResponse* response) GRPC_OVERRIDE {
-    response->set_message(request.message());
-    return Status::OK;
-  }
-  Status Unimplemented(ClientContext* context, const EchoRequest& request,
-                       EchoResponse* response) GRPC_OVERRIDE {
-    return Status::OK;
-  }
-
- private:
-  ClientAsyncResponseReaderInterface<EchoResponse>* AsyncEchoRaw(
-      ClientContext* context, const EchoRequest& request,
-      CompletionQueue* cq) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientWriterInterface<EchoRequest>* RequestStreamRaw(
-      ClientContext* context, EchoResponse* response) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientAsyncWriterInterface<EchoRequest>* AsyncRequestStreamRaw(
-      ClientContext* context, EchoResponse* response, CompletionQueue* cq,
-      void* tag) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientReaderInterface<EchoResponse>* ResponseStreamRaw(
-      ClientContext* context, const EchoRequest& request) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientAsyncReaderInterface<EchoResponse>* AsyncResponseStreamRaw(
-      ClientContext* context, const EchoRequest& request, CompletionQueue* cq,
-      void* tag) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientReaderWriterInterface<EchoRequest, EchoResponse>* BidiStreamRaw(
-      ClientContext* context) GRPC_OVERRIDE {
-    return new MockClientReaderWriter<EchoRequest, EchoResponse>();
-  }
-  ClientAsyncReaderWriterInterface<EchoRequest, EchoResponse>*
-  AsyncBidiStreamRaw(ClientContext* context, CompletionQueue* cq,
-                     void* tag) GRPC_OVERRIDE {
-    return nullptr;
-  }
-  ClientAsyncResponseReaderInterface<EchoResponse>* AsyncUnimplementedRaw(
-      ClientContext* context, const EchoRequest& request,
-      CompletionQueue* cq) GRPC_OVERRIDE {
-    return nullptr;
-  }
-};
-
 class FakeClient {
  public:
   explicit FakeClient(EchoTestService::StubInterface* stub) : stub_(stub) {}
@@ -166,11 +74,60 @@ class FakeClient {
     EXPECT_TRUE(s.ok());
   }
 
+  void DoRequestStream() {
+    EchoRequest request;
+    EchoResponse response;
+
+    ClientContext context;
+    std::string msg("hello");
+    std::string exp(msg);
+
+    std::unique_ptr<ClientWriterInterface<EchoRequest>> cstream =
+        stub_->RequestStream(&context, &response);
+
+    request.set_message(msg);
+    EXPECT_TRUE(cstream->Write(request));
+
+    msg = ", world";
+    request.set_message(msg);
+    exp.append(msg);
+    EXPECT_TRUE(cstream->Write(request));
+
+    cstream->WritesDone();
+    Status s = cstream->Finish();
+
+    EXPECT_EQ(exp, response.message());
+    EXPECT_TRUE(s.ok());
+  }
+
+  void DoResponseStream() {
+    EchoRequest request;
+    EchoResponse response;
+    request.set_message("hello world");
+
+    ClientContext context;
+    std::unique_ptr<ClientReaderInterface<EchoResponse>> cstream =
+        stub_->ResponseStream(&context, request);
+
+    std::string exp = "";
+    EXPECT_TRUE(cstream->Read(&response));
+    exp.append(response.message() + " ");
+
+    EXPECT_TRUE(cstream->Read(&response));
+    exp.append(response.message());
+
+    EXPECT_FALSE(cstream->Read(&response));
+    EXPECT_EQ(request.message(), exp);
+
+    Status s = cstream->Finish();
+    EXPECT_TRUE(s.ok());
+  }
+
   void DoBidiStream() {
     EchoRequest request;
     EchoResponse response;
     ClientContext context;
-    grpc::string msg("hello");
+    std::string msg("hello");
 
     std::unique_ptr<ClientReaderWriterInterface<EchoRequest, EchoResponse>>
         stream = stub_->BidiStream(&context);
@@ -203,17 +160,123 @@ class FakeClient {
   EchoTestService::StubInterface* stub_;
 };
 
+class CallbackTestServiceImpl
+    : public EchoTestService::ExperimentalCallbackService {
+ public:
+  experimental::ServerUnaryReactor* Echo(
+      experimental::CallbackServerContext* context, const EchoRequest* request,
+      EchoResponse* response) override {
+    // Make the mock service explicitly treat empty input messages as invalid
+    // arguments so that we can test various results of status. In general, a
+    // mocked service should just use the original service methods, but we are
+    // adding this variance in Status return value just to improve coverage in
+    // this test.
+    auto* reactor = context->DefaultReactor();
+    if (request->message().length() > 0) {
+      response->set_message(request->message());
+      reactor->Finish(Status::OK);
+    } else {
+      reactor->Finish(Status(StatusCode::INVALID_ARGUMENT, "Invalid request"));
+    }
+    return reactor;
+  }
+};
+
+class MockCallbackTest : public ::testing::Test {
+ protected:
+  CallbackTestServiceImpl service_;
+  ServerContext context_;
+};
+
+TEST_F(MockCallbackTest, MockedCallSucceedsWithWait) {
+  experimental::CallbackServerContext ctx;
+  EchoRequest req;
+  EchoResponse resp;
+  grpc::internal::Mutex mu;
+  grpc::internal::CondVar cv;
+  grpc::Status status;
+  bool status_set = false;
+  DefaultReactorTestPeer peer(&ctx, [&](::grpc::Status s) {
+    grpc::internal::MutexLock l(&mu);
+    status_set = true;
+    status = std::move(s);
+    cv.Signal();
+  });
+
+  req.set_message("mock 1");
+  auto* reactor = service_.Echo(&ctx, &req, &resp);
+  cv.WaitUntil(&mu, [&] {
+    grpc::internal::MutexLock l(&mu);
+    return status_set;
+  });
+  EXPECT_EQ(reactor, peer.reactor());
+  EXPECT_TRUE(peer.test_status_set());
+  EXPECT_TRUE(peer.test_status().ok());
+  EXPECT_TRUE(status_set);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(req.message(), resp.message());
+}
+
+TEST_F(MockCallbackTest, MockedCallSucceeds) {
+  experimental::CallbackServerContext ctx;
+  EchoRequest req;
+  EchoResponse resp;
+  DefaultReactorTestPeer peer(&ctx);
+
+  req.set_message("ha ha, consider yourself mocked.");
+  auto* reactor = service_.Echo(&ctx, &req, &resp);
+  EXPECT_EQ(reactor, peer.reactor());
+  EXPECT_TRUE(peer.test_status_set());
+  EXPECT_TRUE(peer.test_status().ok());
+}
+
+TEST_F(MockCallbackTest, MockedCallFails) {
+  experimental::CallbackServerContext ctx;
+  EchoRequest req;
+  EchoResponse resp;
+  DefaultReactorTestPeer peer(&ctx);
+
+  auto* reactor = service_.Echo(&ctx, &req, &resp);
+  EXPECT_EQ(reactor, peer.reactor());
+  EXPECT_TRUE(peer.test_status_set());
+  EXPECT_EQ(peer.test_status().error_code(), StatusCode::INVALID_ARGUMENT);
+}
+
 class TestServiceImpl : public EchoTestService::Service {
  public:
-  Status Echo(ServerContext* context, const EchoRequest* request,
-              EchoResponse* response) GRPC_OVERRIDE {
+  Status Echo(ServerContext* /*context*/, const EchoRequest* request,
+              EchoResponse* response) override {
     response->set_message(request->message());
     return Status::OK;
   }
 
-  Status BidiStream(ServerContext* context,
-                    ServerReaderWriter<EchoResponse, EchoRequest>* stream)
-      GRPC_OVERRIDE {
+  Status RequestStream(ServerContext* /*context*/,
+                       ServerReader<EchoRequest>* reader,
+                       EchoResponse* response) override {
+    EchoRequest request;
+    std::string resp("");
+    while (reader->Read(&request)) {
+      gpr_log(GPR_INFO, "recv msg %s", request.message().c_str());
+      resp.append(request.message());
+    }
+    response->set_message(resp);
+    return Status::OK;
+  }
+
+  Status ResponseStream(ServerContext* /*context*/, const EchoRequest* request,
+                        ServerWriter<EchoResponse>* writer) override {
+    EchoResponse response;
+    vector<std::string> tokens = split(request->message());
+    for (const std::string& token : tokens) {
+      response.set_message(token);
+      writer->Write(response);
+    }
+    return Status::OK;
+  }
+
+  Status BidiStream(
+      ServerContext* /*context*/,
+      ServerReaderWriter<EchoResponse, EchoRequest>* stream) override {
     EchoRequest request;
     EchoResponse response;
     while (stream->Read(&request)) {
@@ -223,13 +286,32 @@ class TestServiceImpl : public EchoTestService::Service {
     }
     return Status::OK;
   }
+
+ private:
+  const vector<std::string> split(const std::string& input) {
+    std::string buff("");
+    vector<std::string> result;
+
+    for (auto n : input) {
+      if (n != ' ') {
+        buff += n;
+        continue;
+      }
+      if (buff.empty()) continue;
+      result.push_back(buff);
+      buff = "";
+    }
+    if (!buff.empty()) result.push_back(buff);
+
+    return result;
+  }
 };
 
 class MockTest : public ::testing::Test {
  protected:
   MockTest() {}
 
-  void SetUp() GRPC_OVERRIDE {
+  void SetUp() override {
     int port = grpc_pick_unused_port_or_die();
     server_address_ << "localhost:" << port;
     // Setup server
@@ -240,11 +322,11 @@ class MockTest : public ::testing::Test {
     server_ = builder.BuildAndStart();
   }
 
-  void TearDown() GRPC_OVERRIDE { server_->Shutdown(); }
+  void TearDown() override { server_->Shutdown(); }
 
   void ResetStub() {
-    std::shared_ptr<Channel> channel =
-        CreateChannel(server_address_.str(), InsecureChannelCredentials());
+    std::shared_ptr<Channel> channel = grpc::CreateChannel(
+        server_address_.str(), InsecureChannelCredentials());
     stub_ = grpc::testing::EchoTestService::NewStub(channel);
   }
 
@@ -259,16 +341,82 @@ TEST_F(MockTest, SimpleRpc) {
   ResetStub();
   FakeClient client(stub_.get());
   client.DoEcho();
-  MockStub stub;
+  MockEchoTestServiceStub stub;
+  EchoResponse resp;
+  resp.set_message("hello world");
+  EXPECT_CALL(stub, Echo(_, _, _))
+      .Times(AtLeast(1))
+      .WillOnce(DoAll(SetArgPointee<2>(resp), Return(Status::OK)));
   client.ResetStub(&stub);
   client.DoEcho();
 }
+
+TEST_F(MockTest, ClientStream) {
+  ResetStub();
+  FakeClient client(stub_.get());
+  client.DoRequestStream();
+
+  MockEchoTestServiceStub stub;
+  auto w = new MockClientWriter<EchoRequest>();
+  EchoResponse resp;
+  resp.set_message("hello, world");
+
+  EXPECT_CALL(*w, Write(_, _)).Times(2).WillRepeatedly(Return(true));
+  EXPECT_CALL(*w, WritesDone());
+  EXPECT_CALL(*w, Finish()).WillOnce(Return(Status::OK));
+
+  EXPECT_CALL(stub, RequestStreamRaw(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(resp), Return(w)));
+  client.ResetStub(&stub);
+  client.DoRequestStream();
+}
+
+TEST_F(MockTest, ServerStream) {
+  ResetStub();
+  FakeClient client(stub_.get());
+  client.DoResponseStream();
+
+  MockEchoTestServiceStub stub;
+  auto r = new MockClientReader<EchoResponse>();
+  EchoResponse resp1;
+  resp1.set_message("hello");
+  EchoResponse resp2;
+  resp2.set_message("world");
+
+  EXPECT_CALL(*r, Read(_))
+      .WillOnce(DoAll(SetArgPointee<0>(resp1), Return(true)))
+      .WillOnce(DoAll(SetArgPointee<0>(resp2), Return(true)))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*r, Finish()).WillOnce(Return(Status::OK));
+
+  EXPECT_CALL(stub, ResponseStreamRaw(_, _)).WillOnce(Return(r));
+
+  client.ResetStub(&stub);
+  client.DoResponseStream();
+}
+
+ACTION_P(copy, msg) { arg0->set_message(msg->message()); }
 
 TEST_F(MockTest, BidiStream) {
   ResetStub();
   FakeClient client(stub_.get());
   client.DoBidiStream();
-  MockStub stub;
+  MockEchoTestServiceStub stub;
+  auto rw = new MockClientReaderWriter<EchoRequest, EchoResponse>();
+  EchoRequest msg;
+
+  EXPECT_CALL(*rw, Write(_, _))
+      .Times(3)
+      .WillRepeatedly(DoAll(SaveArg<0>(&msg), Return(true)));
+  EXPECT_CALL(*rw, Read(_))
+      .WillOnce(DoAll(WithArg<0>(copy(&msg)), Return(true)))
+      .WillOnce(DoAll(WithArg<0>(copy(&msg)), Return(true)))
+      .WillOnce(DoAll(WithArg<0>(copy(&msg)), Return(true)))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*rw, WritesDone());
+  EXPECT_CALL(*rw, Finish()).WillOnce(Return(Status::OK));
+
+  EXPECT_CALL(stub, BidiStreamRaw(_)).WillOnce(Return(rw));
   client.ResetStub(&stub);
   client.DoBidiStream();
 }
@@ -278,7 +426,7 @@ TEST_F(MockTest, BidiStream) {
 }  // namespace grpc
 
 int main(int argc, char** argv) {
-  grpc_test_init(argc, argv);
+  grpc::testing::TestEnvironment env(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

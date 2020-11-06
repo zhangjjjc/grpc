@@ -1,33 +1,18 @@
 #!/usr/bin/env ruby
 
-# Copyright 2015, Google Inc.
-# All rights reserved.
+# Copyright 2015 gRPC authors.
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     * Redistributions of source code must retain the above copyright
-# notice, this list of conditions and the following disclaimer.
-#     * Redistributions in binary form must reproduce the above
-# copyright notice, this list of conditions and the following disclaimer
-# in the documentation and/or other materials provided with the
-# distribution.
-#     * Neither the name of Google Inc. nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # client is a testing tool that accesses a gRPC interop testing server and runs
 # a test on it.
@@ -110,7 +95,7 @@ end
 
 # creates a test stub that accesses host:port securely.
 def create_stub(opts)
-  address = "#{opts.host}:#{opts.port}"
+  address = "#{opts.server_host}:#{opts.server_port}"
 
   # Provide channel args that request compression by default
   # for compression interop tests
@@ -126,10 +111,13 @@ def create_stub(opts)
   if opts.secure
     creds = ssl_creds(opts.use_test_ca)
     stub_opts = {
-      channel_args: {
-        GRPC::Core::Channel::SSL_TARGET => opts.host_override
-      }
+      channel_args: {}
     }
+    unless opts.server_host_override.empty?
+      stub_opts[:channel_args].merge!({
+          GRPC::Core::Channel::SSL_TARGET => opts.server_host_override
+      })
+    end
 
     # Add service account creds if specified
     wants_creds = %w(all compute_engine_creds service_account_creds)
@@ -158,14 +146,26 @@ def create_stub(opts)
 
     GRPC.logger.info("... connecting securely to #{address}")
     stub_opts[:channel_args].merge!(compression_channel_args)
-    Grpc::Testing::TestService::Stub.new(address, creds, **stub_opts)
+    if opts.test_case == "unimplemented_service"
+      Grpc::Testing::UnimplementedService::Stub.new(address, creds, **stub_opts)
+    else
+      Grpc::Testing::TestService::Stub.new(address, creds, **stub_opts)
+    end
   else
     GRPC.logger.info("... connecting insecurely to #{address}")
-    Grpc::Testing::TestService::Stub.new(
-      address,
-      :this_channel_is_insecure,
-      channel_args: compression_channel_args
-    )
+    if opts.test_case == "unimplemented_service"
+      Grpc::Testing::UnimplementedService::Stub.new(
+        address,
+        :this_channel_is_insecure,
+        channel_args: compression_channel_args
+      )
+    else
+      Grpc::Testing::TestService::Stub.new(
+        address,
+        :this_channel_is_insecure,
+        channel_args: compression_channel_args
+      )
+    end
   end
 end
 
@@ -459,11 +459,8 @@ class NamedTests
     deadline = GRPC::Core::TimeConsts::from_relative_time(1)
     resps = @stub.full_duplex_call(enum.each_item, deadline: deadline)
     resps.each { } # wait to receive each request (or timeout)
-    fail 'Should have raised GRPC::BadStatus(DEADLINE_EXCEEDED)'
-  rescue GRPC::BadStatus => e
-    assert("#{__callee__}: status was wrong") do
-      e.code == GRPC::Core::StatusCodes::DEADLINE_EXCEEDED
-    end
+    fail 'Should have raised GRPC::DeadlineExceeded'
+  rescue GRPC::DeadlineExceeded
   end
 
   def empty_stream
@@ -505,6 +502,153 @@ class NamedTests
     op.wait
   end
 
+  def unimplemented_method
+    begin
+      resp = @stub.unimplemented_call(Empty.new)
+    rescue GRPC::Unimplemented => e
+      return
+    rescue Exception => e
+      fail AssertionError, "Expected BadStatus. Received: #{e.inspect}"
+    end
+    fail AssertionError, "GRPC::Unimplemented should have been raised. Was not."
+  end
+
+  def unimplemented_service
+    begin
+      resp = @stub.unimplemented_call(Empty.new)
+    rescue GRPC::Unimplemented => e
+      return
+    rescue Exception => e
+      fail AssertionError, "Expected BadStatus. Received: #{e.inspect}"
+    end
+    fail AssertionError, "GRPC::Unimplemented should have been raised. Was not."
+  end
+
+  def status_code_and_message
+
+    # Function wide constants.
+    message = "test status method"
+    code = GRPC::Core::StatusCodes::UNKNOWN
+
+    # Testing with UnaryCall.
+    payload = Payload.new(type: :COMPRESSABLE, body: nulls(1))
+    echo_status = EchoStatus.new(code: code, message: message)
+    req = SimpleRequest.new(response_type: :COMPRESSABLE,
+			    response_size: 1,
+			    payload: payload,
+			    response_status: echo_status)
+    seen_correct_exception = false
+    begin
+      resp = @stub.unary_call(req)
+    rescue GRPC::Unknown => e
+      if e.details != message
+	      fail AssertionError,
+	        "Expected message #{message}. Received: #{e.details}"
+      end
+      seen_correct_exception = true
+    rescue Exception => e
+      fail AssertionError, "Expected BadStatus. Received: #{e.inspect}"
+    end
+
+    if not seen_correct_exception
+      fail AssertionError, "Did not see expected status from UnaryCall"
+    end
+
+    # testing with FullDuplex
+    req_cls, p_cls = StreamingOutputCallRequest, ResponseParameters
+    duplex_req = req_cls.new(payload: Payload.new(body: nulls(1)),
+                  response_type: :COMPRESSABLE,
+                  response_parameters: [p_cls.new(size: 1)],
+                  response_status: echo_status)
+    seen_correct_exception = false
+    begin
+      resp = @stub.full_duplex_call([duplex_req])
+      resp.each { |r| }
+    rescue GRPC::Unknown => e
+      if e.details != message
+        fail AssertionError,
+          "Expected message #{message}. Received: #{e.details}"
+      end
+      seen_correct_exception = true
+    rescue Exception => e
+      fail AssertionError, "Expected BadStatus. Received: #{e.inspect}"
+    end
+
+    if not seen_correct_exception
+      fail AssertionError, "Did not see expected status from FullDuplexCall"
+    end
+
+  end
+
+
+  def custom_metadata
+
+    # Function wide constants
+    req_size, wanted_response_size = 271_828, 314_159
+    initial_metadata_key = "x-grpc-test-echo-initial"
+    initial_metadata_value = "test_initial_metadata_value"
+    trailing_metadata_key = "x-grpc-test-echo-trailing-bin"
+    trailing_metadata_value = "\x0a\x0b\x0a\x0b\x0a\x0b"
+
+    metadata = {
+      initial_metadata_key => initial_metadata_value,
+      trailing_metadata_key => trailing_metadata_value
+    }
+
+    # Testing with UnaryCall
+    payload = Payload.new(type: :COMPRESSABLE, body: nulls(req_size))
+    req = SimpleRequest.new(response_type: :COMPRESSABLE,
+			    response_size: wanted_response_size,
+			    payload: payload)
+
+    op = @stub.unary_call(req, metadata: metadata, return_op: true)
+    op.execute
+    if not op.metadata.has_key?(initial_metadata_key)
+      fail AssertionError, "Expected initial metadata. None received"
+    elsif op.metadata[initial_metadata_key] != metadata[initial_metadata_key]
+      fail AssertionError,
+             "Expected initial metadata: #{metadata[initial_metadata_key]}. "\
+             "Received: #{op.metadata[initial_metadata_key]}"
+    end
+    if not op.trailing_metadata.has_key?(trailing_metadata_key)
+      fail AssertionError, "Expected trailing metadata. None received"
+    elsif op.trailing_metadata[trailing_metadata_key] !=
+          metadata[trailing_metadata_key]
+      fail AssertionError,
+            "Expected trailing metadata: #{metadata[trailing_metadata_key]}. "\
+            "Received: #{op.trailing_metadata[trailing_metadata_key]}"
+    end
+
+    # Testing with FullDuplex
+    req_cls, p_cls = StreamingOutputCallRequest, ResponseParameters
+    duplex_req = req_cls.new(payload: Payload.new(body: nulls(req_size)),
+                  response_type: :COMPRESSABLE,
+                  response_parameters: [p_cls.new(size: wanted_response_size)])
+
+    duplex_op = @stub.full_duplex_call([duplex_req], metadata: metadata,
+                                        return_op: true)
+    resp = duplex_op.execute
+    resp.each { |r| } # ensures that the server sends trailing data
+    duplex_op.wait
+    if not duplex_op.metadata.has_key?(initial_metadata_key)
+      fail AssertionError, "Expected initial metadata. None received"
+    elsif duplex_op.metadata[initial_metadata_key] !=
+          metadata[initial_metadata_key]
+      fail AssertionError,
+             "Expected initial metadata: #{metadata[initial_metadata_key]}. "\
+             "Received: #{duplex_op.metadata[initial_metadata_key]}"
+    end
+    if not duplex_op.trailing_metadata[trailing_metadata_key]
+      fail AssertionError, "Expected trailing metadata. None received"
+    elsif duplex_op.trailing_metadata[trailing_metadata_key] !=
+          metadata[trailing_metadata_key]
+      fail AssertionError,
+          "Expected trailing metadata: #{metadata[trailing_metadata_key]}. "\
+          "Received: #{duplex_op.trailing_metadata[trailing_metadata_key]}"
+    end
+
+  end
+
   def all
     all_methods = NamedTests.instance_methods(false).map(&:to_s)
     all_methods.each do |m|
@@ -540,13 +684,13 @@ class NamedTests
   # Send probing message for compressed request on the server, to see
   # if it's implemented.
   def send_probe_for_compressed_request_support(&send_probe)
-    bad_status_occured = false
+    bad_status_occurred = false
 
     begin
       send_probe.call
     rescue GRPC::BadStatus => e
       if e.code == GRPC::Core::StatusCodes::INVALID_ARGUMENT
-        bad_status_occured = true
+        bad_status_occurred = true
       else
         fail AssertionError, "Bad status received but code is #{e.code}"
       end
@@ -555,26 +699,26 @@ class NamedTests
     end
 
     assert('CompressedRequest probe failed') do
-      bad_status_occured
+      bad_status_occurred
     end
   end
 
 end
 
 # Args is used to hold the command line info.
-Args = Struct.new(:default_service_account, :host, :host_override,
-                  :oauth_scope, :port, :secure, :test_case,
+Args = Struct.new(:default_service_account, :server_host, :server_host_override,
+                  :oauth_scope, :server_port, :secure, :test_case,
                   :use_test_ca)
 
-# validates the the command line options, returning them as a Hash.
+# validates the command line options, returning them as a Hash.
 def parse_args
   args = Args.new
-  args.host_override = 'foo.test.google.fr'
+  args.server_host_override = ''
   OptionParser.new do |opts|
     opts.on('--oauth_scope scope',
             'Scope for OAuth tokens') { |v| args['oauth_scope'] = v }
     opts.on('--server_host SERVER_HOST', 'server hostname') do |v|
-      args['host'] = v
+      args['server_host'] = v
     end
     opts.on('--default_service_account email_address',
             'email address of the default service account') do |v|
@@ -582,9 +726,11 @@ def parse_args
     end
     opts.on('--server_host_override HOST_OVERRIDE',
             'override host via a HTTP header') do |v|
-      args['host_override'] = v
+      args['server_host_override'] = v
     end
-    opts.on('--server_port SERVER_PORT', 'server port') { |v| args['port'] = v }
+    opts.on('--server_port SERVER_PORT', 'server port') do |v|
+      args['server_port'] = v
+    end
     # instance_methods(false) gives only the methods defined in that class
     test_cases = NamedTests.instance_methods(false).map(&:to_s)
     test_case_list = test_cases.join(',')
@@ -593,7 +739,7 @@ def parse_args
     opts.on('--use_tls USE_TLS', ['false', 'true'],
             'require a secure connection?') do |v|
       args['secure'] = v == 'true'
-p    end
+    end
     opts.on('--use_test_ca USE_TEST_CA', ['false', 'true'],
             'if secure, use the test certificate?') do |v|
       args['use_test_ca'] = v == 'true'
@@ -603,7 +749,7 @@ p    end
 end
 
 def _check_args(args)
-  %w(host port test_case).each do |a|
+  %w(server_host server_port test_case).each do |a|
     if args[a].nil?
       fail(OptionParser::MissingArgument, "please specify --#{a}")
     end
